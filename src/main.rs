@@ -1,11 +1,12 @@
 use anyhow::Context;
 use clap::Parser;
-use flate2::read::ZlibDecoder;
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use sha1::{Digest, Sha1};
 use std::{
     ffi::CStr,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Parser)]
@@ -25,12 +26,12 @@ enum Command {
 
         object_hash: String,
     },
-    // HashObject {
-    //     #[clap(short = 'w')]
-    //     write: bool,
+    HashObject {
+        #[clap(short = 'w')]
+        write: bool,
 
-    //     file: PathBuf,
-    // },
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -96,28 +97,84 @@ fn main() -> anyhow::Result<()> {
             };
 
             let size = size
-                .parse::<usize>()
+                .parse::<u64>()
                 .context(".git/objects file header has invalid size: {size}")?;
 
-            buf.clear();
-            buf.resize(size, 0);
-            z.read_exact(&mut buf[..])
-                .context("read true contents of .git/objects file")?;
-
-            let n = z
-                .read(&mut [0])
-                .context("validate EOF in .git/objects file")?;
-
-            anyhow::ensure!(n == 0, ".git/object file had {n} trailing bytes");
-            let stdout = std::io::stdout();
-            let mut stdout = stdout.lock();
+            let mut z = z.take(size);
 
             match kind {
-                Kind::Blob => stdout
-                    .write_all(&buf)
-                    .context("write object contents to stdout")?,
+                Kind::Blob => {
+                    let stdout = std::io::stdout();
+                    let mut stdout = stdout.lock();
+                    let n = std::io::copy(&mut z, &mut stdout)
+                        .context("write .git/objects file to stdout")?;
+                    anyhow::ensure!(n == size, ".git/object file was not the expected size (expected: {size}, actual: {n})");
+                }
             }
+        }
+        Command::HashObject { write, file } => {
+            fn write_blob<W>(file: &Path, writer: W) -> anyhow::Result<String>
+            where
+                W: Write,
+            {
+                let stat =
+                    std::fs::metadata(&file).with_context(|| format!("stat {}", file.display()))?;
+
+                let writer = ZlibEncoder::new(writer, Compression::default());
+                let mut writer = HashWriter {
+                    writer,
+                    hasher: Sha1::new(),
+                };
+                write!(writer, "blob ")?;
+                write!(writer, "{}\0", stat.len())?;
+
+                let mut file = std::fs::File::open(&file)
+                    .with_context(|| format!("open {}", file.display()))?;
+
+                std::io::copy(&mut file, &mut writer).context("stream file into bob")?;
+                let _ = writer.writer.finish()?;
+                let hash = writer.hasher.finalize();
+                Ok(hex::encode(hash))
+            }
+
+            let hash = if write {
+                let tmp = "temporary";
+                let hash = write_blob(
+                    &file,
+                    std::fs::File::create(tmp).context("construct remporary file for blob")?,
+                )
+                .context("write blob object")?;
+                fs::create_dir_all(format!(".git/objects/{}", &hash[..2]))
+                    .context("create subdir of .git/objects")?;
+                std::fs::rename(tmp, format!(".git/objects/{}/{}", &hash[..2], &hash[2..]))
+                    .context("move temporary file to final location")?;
+                hash
+            } else {
+                write_blob(&file, std::io::sink()).context("write out blob object")?
+            };
+
+            println!("{}", hash);
         }
     }
     Ok(())
+}
+
+struct HashWriter<W> {
+    writer: W,
+    hasher: Sha1,
+}
+
+impl<W> Write for HashWriter<W>
+where
+    W: Write,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.writer.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
 }

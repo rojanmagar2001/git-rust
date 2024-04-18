@@ -1,48 +1,23 @@
 use anyhow::Context;
-use flate2::{write::ZlibEncoder, Compression};
 use sha1::{Digest, Sha1};
-use std::{fs, io::Write, path::Path};
+use std::{io::Write, path::Path};
+
+use crate::objects::Object;
 
 pub(crate) fn invoke(write: bool, file: &Path) -> anyhow::Result<()> {
-    fn write_blob<W>(file: &Path, writer: W) -> anyhow::Result<String>
-    where
-        W: Write,
-    {
-        let stat = std::fs::metadata(&file).with_context(|| format!("stat {}", file.display()))?;
+    let object = Object::blob_from_file(file).context("open blob input file")?;
 
-        let writer = ZlibEncoder::new(writer, Compression::default());
-        let mut writer = HashWriter {
-            writer,
-            hasher: Sha1::new(),
-        };
-        write!(writer, "blob ")?;
-        write!(writer, "{}\0", stat.len())?;
-
-        let mut file =
-            std::fs::File::open(&file).with_context(|| format!("open {}", file.display()))?;
-
-        std::io::copy(&mut file, &mut writer).context("stream file into bob")?;
-        let _ = writer.writer.finish()?;
-        let hash = writer.hasher.finalize();
-        Ok(hex::encode(hash))
-    }
     let hash = if write {
-        let tmp = "temporary";
-        let hash = write_blob(
-            &file,
-            std::fs::File::create(tmp).context("construct remporary file for blob")?,
-        )
-        .context("write blob object")?;
-        fs::create_dir_all(format!(".git/objects/{}", &hash[..2]))
-            .context("create subdir of .git/objects")?;
-        std::fs::rename(tmp, format!(".git/objects/{}/{}", &hash[..2], &hash[2..]))
-            .context("move temporary file to final location")?;
-        hash
+        object
+            .write_to_objects()
+            .context("stream file into blob object file")?
     } else {
-        write_blob(&file, std::io::sink()).context("write out blob object")?
+        object
+            .write(std::io::sink())
+            .context("stream file into blob object")?
     };
 
-    println!("{}", hash);
+    println!("{}", hex::encode(hash));
 
     Ok(())
 }
